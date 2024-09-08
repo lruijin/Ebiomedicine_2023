@@ -1,0 +1,314 @@
+---
+title: "Combat preprocessing"
+author: "Ruijin Lu"
+date: "11/3/2020"
+output: html_document
+---
+
+```{r setup, message=FALSE}
+library(sva)
+lipid <- read.csv("../Data/lipid_imputed_wosmoke.csv") 
+met_idx <- 4:423
+DFmet <- t(lipid[,met_idx])
+mod = model.matrix(~GA_blood,data=lipid)
+batch = lipid$batch
+```
+
+## Parametric adjustment
+```{r}
+combat_DFmet0 = ComBat(dat= DFmet, batch = batch, mod = mod, par.prior = T, prior.plots = T)
+```
+
+The black lines are kernel estimates of the empirical batch effect density and the red are the parametric estimates. We observed discrepancy between the estimated lines and the empirical lines.
+
+We then try the non-parametric estimation:
+```{r,cache=T}
+combat_DFmet1 = ComBat(dat= DFmet, batch = batch, mod = mod, par.prior = F)
+
+sum(is.nan(combat_DFmet1))
+```
+
+The model fails to obtain values after removing batch effect when using the non-parametric way of estimation. As all measurements of the metabolites are greater than 0, we take log transformation and adjust the data using parametric empirical Bayesian adjustments.
+```{r}
+combat_DFmet2 = ComBat(dat= log(DFmet), batch = batch, mod = mod, par.prior = T, prior.plots = T)
+sum(is.nan(combat_DFmet2))
+```
+
+We see that it is more reasonable to use the parametric estimation with log-transformed data and the model is able to adjust all the variables.
+
+The final metabolite matrix for the downstream analysis is `combat_DFmet2`. It takes logarithm of the original data first and then removes the batch effect with parametric empirical Bayesian estimation while adjusting for gestational age at blood measurement.
+
+## Continuous fetal measurements vs. the metabolite measurements at each visit.
+
+### Birthweight
+```{r}
+# replace the data with the new surrogate variables.
+lipid_new <- lipid
+lipid_new[,met_idx] <- t(combat_DFmet2)
+anno <- read.csv("../Data/Lipidomics_annotation_file.csv",header=T, sep=",")
+anno$met_ID <- chartr(old = ".", new = "_", anno$lipid_identifier)
+```
+```{r bw, eval=FALSE}
+for (visit in c(0, 1, 2, 4)) {    # By visit
+ 
+  ###1.Read and prepare data---------------------------------------------------------------
+  DF <- lipid_new[lipid_new$Visit == visit,]
+  DF <- data.frame(ID = DF$ID, pairID = DF$PairID, v = (1/DF$wt)^2, GA_blood = DF$GA_blood,
+                   age = DF$age, race = factor(DF$race), education = factor(DF$Education, ordered = T), 
+                   preBMI = DF$preBMI, nulli = factor(as.integer(DF$Nulliparious)), Gender = DF$Gender,
+                   anthro = DF$bwz, alcohol = DF$Alcohol_bin, batch = factor(DF$batch), post = DF$measuredate,
+                   DF[,met_idx])
+  met_index_df <- c(15:434)
+  
+  ###2.Estimate batch-specific effects-----------------------------------------------------
+  #Define LME function: random intercept - pairID, weighted
+  lme_met <- function(x) {
+    DF2 <- DF[,c(1:14)]
+    DF2$met <- x
+    DF2 <- na.omit(DF2)
+    #model = lme(anthro ~ met + age + as.factor(race) + preBMI + parity + female + GADel + glucose, 
+    #            data = nDF2, random = ~1 | pairID, weights = varFixed(~v))
+    model = lme(anthro ~ met + age + race + education + preBMI + GA_blood + Gender + nulli + alcohol + post, 
+                data = DF2, random = ~1 | pairID, weights = varFixed(~v))
+    est   <- c(summary(model)$tTable[2,])
+    return(est)
+  }
+  
+ 
+  res <- as.data.frame(t(sapply(DF[,met_index_df], lme_met)))[,c(1,2,5)]
+  colnames(res) <- c("beta","se","pval")
+  res$met_ID <- substring(row.names(res), 4)
+  res <- inner_join(anno, res, by = "met_ID")
+  res$pBonf <- p.adjust(res$pval,"bonferroni")
+  res$pFDR <- p.adjust(res$pval,"fdr")
+  
+  write.csv(res, paste("../tmp/bwz", visit, ".csv",sep=""), row.names=F)
+
+}
+```
+
+* Significant metabolites:
+```{r}
+library(dplyr)
+#Merge results from all 4 visits
+bw0 <- read.csv("../tmp/bw0.csv", header=T, sep=",")
+bw1 <- read.csv("../tmp/bw1.csv", header=T, sep=",")
+bw2 <- read.csv("../tmp/bw2.csv", header=T, sep=",")
+bw4 <- read.csv("../tmp/bw4.csv", header=T, sep=",")
+for(visit in c(0,1,2,4)){
+  assign(paste0("bw",visit), data.frame(get(paste0("bw",visit)), Visit = visit))
+}
+
+bw = rbind(bw0,bw1,bw2,bw4)
+
+bw$Anno. <- substring(bw$Annotation,1,3)
+tab.res = bw %>% filter(pFDR < 0.05) %>%
+  arrange(Annotation, met_ID) %>%
+  select(Anno.,Annotation,met_ID,Visit,beta)
+rbind(cbind(table(tab.res$Anno., tab.res$Visit),
+      rowSums(table(tab.res$Anno., tab.res$Visit))),
+      colSums(cbind(table(tab.res$Anno., tab.res$Visit),
+      rowSums(table(tab.res$Anno., tab.res$Visit)))))
+
+bw_merge <- inner_join(inner_join(inner_join(bw0,bw1[,c("met_ID","beta","pval","pBonf","pFDR")], by="met_ID"),
+                       bw2[,c("met_ID","beta","pval","pBonf","pFDR")], by="met_ID"),
+                       bw4[,c("met_ID","beta","pval","pBonf","pFDR")], by="met_ID")
+names(bw_merge)[c(9,11:13,15:26)] <- paste0(rep(c("beta","pval","pBonf","pFDR"),4),rep(c(0,1,2,4),each=4))
+bw_merge$significance <- (bw_merge$pFDR0<0.05) + (bw_merge$pFDR1<0.05) + (bw_merge$pFDR2<0.05) + (bw_merge$pFDR4<0.05)
+table(bw_merge$significance)
+```
+
+In total, there are 268 out of the 420 metabolites showed significance at least at one visit. None of them are significant among all four visits. most of them are significant at only one visit. Later, I will select one metabolites that is significant in three visits and one metabolite that is not significant at any visit.
+
+```{r}
+idx_sel <- c(which(bw_merge$significance == 3)[1],which(bw_merge$significance == 0)[1])
+met_sel <- paste0("id_",bw_merge$met_ID[idx_sel])
+col_sel <- c(which(names(lipid_new) == met_sel[1]),which(names(lipid_new) == met_sel[2]))
+```
+
+For the first selected metabolite, we plot its trajectories with different colors for different batches. 
+```{r}
+library(ggplot2)
+ggplot(lipid, aes(y = lipid[,col_sel[1]], x = GA_blood, group=factor(ID)))+geom_line(aes(color= factor(batch)))
+```
+
+The plot above shows that the first batch has overall higher level than the other two batches and it has more variation in the measurement as well.
+
+```{r}
+ggplot(lipid_new, aes(y = lipid_new[,col_sel[1]], x = GA_blood, group=factor(ID)))+geom_line(aes(color= factor(batch)))
+```
+
+With the batch effect removed, we see that the three batches are not separated as before and we can hardly tell the systematic difference among different batches.
+
+We plot the same two plots for the other selected metabolite.
+```{r}
+ggplot(lipid, aes(y = lipid[,col_sel[2]], x = GA_blood, group=factor(ID)))+geom_line(aes(color= factor(batch)))
+
+ggplot(lipid_new, aes(y = lipid_new[,col_sel[2]], x = GA_blood, group=factor(ID)))+geom_line(aes(color= factor(batch)))
+```
+
+We see similar results that the three batches are combined well.
+
+## Trajectory analysis for the two selected metabolites
+
+Next, we will conduct trajectory analysis for the two selected metabolites and see if the results are consistent with the individual analysis at discrete time points. First, we obtain the dataset for the two metabolites:
+
+```{r,eval=F}
+tmp <- lipid_new[lipid_new$Visit==0,c(1,2,425,col_sel[2])]
+for(visit in c(1,2,4)){
+  tmp <- merge(tmp, lipid_new[lipid_new$Visit==visit,c(1,2,col_sel[2])], by = "ID", all = T)
+}
+names(tmp) <- c("ID","T1","wt","V1","T2","V2","T3","V3","T4","V4")
+tmp <- select(tmp,c(ID,wt,T1,T2,T3,T4,V1,V2,V3,V4))
+write.csv(tmp,"../Data/sas_data/test_none.csv",row.names=F)
+```
+
+### For the selected metabolite not significant at any visit
+
+We plot the estimated mean trajectories
+```{r}
+op <- read.csv("../Data/sas_data/res/op/none.csv")
+plot(op$T,op$AVG1,type="l",xlim = c(10,40), ylim = c(min(lipid_new[col_sel[2]]),max(lipid_new[col_sel[2]])))
+lines(op$T,op$AVG2, col = 2)
+lines(op$T, op$AVG3, col=3)
+legend("topright",legend = paste0("Group",1:3),col=1:3,lty=1)
+```
+
+The estimated group tags are attached to the fetal measurements for mixed effect linear model analysis.
+```{r}
+
+ DF <- lipid_new[lipid_new$Visit == 0,]
+ DF <- data.frame(ID = DF$ID, pairID = DF$PairID, v = (1/DF$wt)^2, GA_blood = DF$GA_blood,
+                   age = DF$age, race = factor(DF$race), education = factor(DF$Education, ordered = T), 
+                   preBMI = DF$preBMI, nulli = factor(as.integer(DF$Nulliparious)), Gender = DF$Gender,
+                   anthro = DF$bw.x/1000, alcohol = DF$Alcohol_bin, batch = factor(DF$batch), post = DF$measuredate)
+ grouping <- read.csv("../Data/sas_data/res/out/out6.csv")
+ #grouping %>% group_by(GROUP) %>%
+ # summarise(mean(GRP1PRB),mean(GRP2PRB), mean(GRP3PRB),
+ #           sd(GRP1PRB),sd(GRP2PRB), sd(GRP3PRB))
+ DF <- merge(DF, grouping[,c("ID","GROUP")],by="ID")
+ DF <- na.omit(DF)
+ model = lme(anthro ~ factor(GROUP) + age + race + education + preBMI + GA_blood + Gender + nulli + alcohol + post, 
+                data = DF, random = ~1 | pairID, weights = varFixed(~v))
+ #library(car)
+ summary(model)$tTable
+ Anova(model,type=2)[[3]][1]
+ bw0$pval[6];bw1$pval[6];bw2$pval[6];bw4$pval[6]
+```
+### For the selected metabolite significant at all visits
+
+We plot the estimated mean trajectories
+```{r}
+op <- read.csv("../Data/sas_data/res/op/all.csv")
+plot(op$T,op$AVG1,type="l",xlim = c(10,40), ylim = c(min(lipid_new[col_sel[1]]),max(lipid_new[col_sel[1]])))
+lines(op$T,op$AVG2, col = 2)
+legend("topright",legend = paste0("Group",1:2),col=1:2,lty=1)
+```
+
+The estimated group tags are attached to the fetal measurements for mixed effect linear model analysis.
+```{r}
+ DF <- lipid_new[lipid_new$Visit == 0,]
+ DF <- data.frame(ID = DF$ID, pairID = DF$PairID, v = (1/DF$wt)^2, GA_blood = DF$GA_blood,
+                   age = DF$age, race = factor(DF$race), education = factor(DF$Education, ordered = T), 
+                   preBMI = DF$preBMI, nulli = factor(as.integer(DF$Nulliparious)), Gender = DF$Gender,
+                   anthro = DF$bw.x/1000, alcohol = DF$Alcohol_bin, batch = factor(DF$batch), post = DF$measuredate)
+ grouping <- read.csv("../Data/sas_data/res/out/all.csv")
+ DF <- merge(DF, grouping[,c("ID","GROUP")],by="ID")
+ DF <- na.omit(DF)
+ model = lme(anthro ~ factor(GROUP) + age + race + education + preBMI + GA_blood + Gender + nulli + alcohol + post, 
+                data = DF, random = ~1 | pairID, weights = varFixed(~v))
+ #library(car)
+ summary(model)$tTable
+ Anova(model,type=2)
+```
+
+The result is not consistent with the individual tests. We test other two metabolites. Still, one is significant at three visits and the other is not significant at any visit:
+```{r}
+idx_sel <- c(which(bw_merge$significance == 3)[2],which(bw_merge$significance == 0)[2])
+met_sel <- paste0("id_",bw_merge$met_ID[idx_sel])
+col_sel <- c(which(names(lipid_new) == met_sel[1]),which(names(lipid_new) == met_sel[2]))
+bw_merge[idx_sel,]
+```
+```{r,eval=F}
+tmp <- lipid_new[lipid_new$Visit==0,c(1,2,425,col_sel[2])]
+for(visit in c(1,2,4)){
+  tmp <- merge(tmp, lipid_new[lipid_new$Visit==visit,c(1,2,col_sel[2])], by = "ID", all = T)
+}
+names(tmp) <- c("ID","T1","wt","V1","T2","V2","T3","V3","T4","V4")
+tmp <- select(tmp,c(ID,wt,T1,T2,T3,T4,V1,V2,V3,V4))
+write.csv(tmp,"../Data/sas_data/test_none1.csv",row.names=F)
+```
+
+### For the selected metabolite significant at all visits
+
+We plot the estimated mean trajectories
+```{r}
+op <- read.csv("../Data/sas_data/res/op/all1.csv")
+plot(op$T,op$AVG1,type="l",xlim = c(10,40), ylim = c(min(lipid_new[col_sel[1]]),max(lipid_new[col_sel[1]])))
+lines(op$T,op$AVG2, col = 2)
+lines(op$T,op$AVG3, col = 3)
+legend("topright",legend = paste0("Group",1:3),col=1:3,lty=1)
+```
+
+The estimated group tags are attached to the fetal measurements for mixed effect linear model analysis.
+```{r}
+ DF <- lipid_new[lipid_new$Visit == 0,]
+ DF <- data.frame(ID = DF$ID, pairID = DF$PairID, v = (1/DF$wt)^2, GA_blood = DF$GA_blood,
+                   age = DF$age, race = factor(DF$race), education = factor(DF$Education, ordered = T), 
+                   preBMI = DF$preBMI, nulli = factor(as.integer(DF$Nulliparious)), Gender = DF$Gender,
+                   anthro = DF$bw.x/1000, alcohol = DF$Alcohol_bin, batch = factor(DF$batch), post = DF$measuredate)
+ grouping <- read.csv("../Data/sas_data/res/out/all1.csv")
+ DF <- merge(DF, grouping[,c("ID","GROUP")],by="ID")
+ DF <- na.omit(DF)
+ model = lme(anthro ~ factor(GROUP) + age + race + education + preBMI + GA_blood + Gender + nulli + alcohol + post, 
+                data = DF, random = ~1 | pairID, weights = varFixed(~v))
+ #library(car)
+ summary(model)$tTable
+ Anova(model,type=2)
+```
+
+### For the selected metabolite not significant at any visit
+
+We plot the estimated mean trajectories
+```{r}
+op <- read.csv("../Data/sas_data/res/op/none1.csv")
+plot(op$T,op$AVG1,type="l",xlim = c(10,40), ylim = c(min(lipid_new[col_sel[2]]),max(lipid_new[col_sel[2]])))
+lines(op$T,op$AVG2, col = 2)
+lines(op$T,op$AVG3, col = 3)
+legend("topright",legend = paste0("Group",1:3),col=1:3,lty=1)
+```
+
+The estimated group tags are attached to the fetal measurements for mixed effect linear model analysis.
+```{r}
+ DF <- lipid_new[lipid_new$Visit == 0,]
+ DF <- data.frame(ID = DF$ID, pairID = DF$PairID, v = (1/DF$wt)^2, GA_blood = DF$GA_blood,
+                   age = DF$age, race = factor(DF$race), education = factor(DF$Education, ordered = T), 
+                   preBMI = DF$preBMI, nulli = factor(as.integer(DF$Nulliparious)), Gender = DF$Gender,
+                   anthro = DF$bw.x/1000, alcohol = DF$Alcohol_bin, batch = factor(DF$batch), post = DF$measuredate)
+ grouping <- read.csv("../Data/sas_data/res/out/none1.csv")
+ DF <- merge(DF, grouping[,c("ID","GROUP")],by="ID")
+ DF <- na.omit(DF)
+ model = lme(anthro ~ factor(GROUP) + age + race + education + preBMI + GA_blood + Gender + nulli + alcohol + post, 
+                data = DF, random = ~1 | pairID, weights = varFixed(~v))
+ #library(car)
+ summary(model)$tTable
+ Anova(model,type=2)
+```
+
+Still, the result is not as expected. The metabolite not significant at any visit is more significant than the one who is significant at three visits.
+
+We try to obtain the individual analysis of these two metabolites.
+
+* For the one which is not significant at any visit:
+```{r}
+bw_merge[bw_merge$met_ID == substring(met_sel[2],4),]
+ggplot(lipid_new, aes(y = bw.x,x = id_1_20_544_34, group = factor(Visit))) + geom_point(aes(col = factor(Visit)))
+
+```
+
+* For the one which is significant at all visits:
+```{r}
+bw_merge[bw_merge$met_ID == substring(met_sel[1],4),]
+ggplot(lipid_new, aes(y = bw.x,x = id_9_72_958_81, group = factor(Visit))) + geom_point(aes(col = factor(Visit)))
+
+```
